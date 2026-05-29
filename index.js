@@ -947,9 +947,14 @@ async function authenticateAndCheckOwnership() {
         await saveAuthCache("default", JSON.stringify(flow.cache));
 
     } catch (err) {
-        console.error(`Authentication failed: ${err.message}`);
+        console.error("------ IMPORTANT ------");
+        console.error("Authentication failed.");
+        console.error("If you're running this over SSH, the Linux keyring is locked and cannot store credentials.");
+        console.error("Please run the launcher from the Raspberry Pi desktop session instead.");
+        console.error(`Details: ${err.message}`);
         process.exit(1);
     }
+
 
     // Ownership check
     const ownsMinecraft = result.entitlements?.items?.some(
@@ -957,7 +962,11 @@ async function authenticateAndCheckOwnership() {
     );
 
     if (!ownsMinecraft) {
-        console.error("You do not own Minecraft.");
+        console.error("----- YOU DO NOT OWN MINECRAFT -----");
+        console.error("In order to use this launcher, you must own Minecraft Java Edition on your Microsoft account.");
+        console.error("If you believe this is a mistake, please contact support with your account details.");
+        console.error("If you were attempting to use a cracked or pirated account, please purchase the game to use this launcher.");
+        console.error("-----------------------------------");
         process.exit(1);
     }
 
