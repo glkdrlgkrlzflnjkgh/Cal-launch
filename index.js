@@ -368,7 +368,7 @@ async function validateJavaPath(javaPath) {
 }
 
 // ---------- Mojang Java runtime download (per-version, from metadata.javaVersion.component) ----------
-// DEPRECATED: Mojang runtimes are no longer commonly used and their API is dead. We use azul's Zulu API instead.
+// DEPRECATED, DO NOT USE OR MODIFY: Mojang runtimes are no longer commonly used and their API is dead. We use azul's Zulu API instead.
 async function tryDownloadMojangJava(versionId, metadata) {
     const versionDir = path.join(VERSIONS_DIR, versionId);
     const runtimeDir = path.join(versionDir, "java");
@@ -625,10 +625,9 @@ async function downloadAssets(metadata) {
     } catch (err) {
         console.error(`[assets] Failed to save asset index: ${err.message}`);
     }
-
+    console.log("[assets] Ready to download asset objects...");
     const objects = assetIndex.objects || {};
     const entries = Object.entries(objects);
-    console.log(`[+] Assets to download: ${entries.length}`);
 
     const jobs = [];
     for (const [, obj] of entries) {
