@@ -10,9 +10,22 @@ import readline from "readline";
 import { spawn } from "child_process";
 import AdmZip from "adm-zip";
 
+
 // ---------- Zulu Java Downloader (per-version) ----------
 // ---------- Zulu Java Downloader (Metadata API, per-version) ----------
 const ZULU_META = "https://api.azul.com/metadata/v1/zulu/packages/";
+function BoxMsg(msg) {
+    const lines = msg.split("\n");
+    const width = Math.max(...lines.map(l => l.length));
+    const top = "╭" + "─".repeat(width + 2) + "╮";
+    const bottom = "╰" + "─".repeat(width + 2) + "╯";
+
+    console.log(top);
+    for (const line of lines) {
+        console.log("│ " + line.padEnd(width) + " │");
+    }
+    console.log(bottom);
+}
 
 function detectZuluPlatform() {
     const platform = process.platform;
@@ -282,6 +295,7 @@ async function runDownloadQueue(jobs, name, workers) {
             clearOnComplete: true,
             hideCursor: true,
             format: `${name} {bar} {percentage}% | {value}/{total}`
+            
         },
         cliProgress.Presets.shades_classic
     );
@@ -976,12 +990,15 @@ async function authenticateAndCheckOwnership() {
 result = await authenticateAndCheckOwnership();
 // ---------- Main menu loop ----------
 while (true) {
-    console.log("\n=== CALLAUNCHER MENU ===");
-    console.log("1. Install a version");
-    console.log("2. Launch installed version");
-    console.log("3. Uninstall a version");
-    console.log("4. Settings");
-    console.log("5. Exit\n");
+    BoxMsg(
+        `=== CALLAUNCHER MENU ===
+    1. Install a version
+    2. Launch installed version
+    3. Uninstall a version
+    4. Settings
+    5. Exit`
+    );
+
 
     const choice = await ask("Select an option: ");
 
