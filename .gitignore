@@ -3,3 +3,4 @@ node_modules
 auth-cache
 logs
 level.dat
+*.log
