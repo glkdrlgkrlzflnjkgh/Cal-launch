@@ -1,6 +1,5 @@
-// CALLAUNCHER — per-instance Java only, PrismLauncher Java runtimes when available, settings.json (C-style),
-// download workers, no Blessed, full menus, auth, manifest, launch.
-import { saveAuthCache, loadAuthCache } from "./secureStore.js";
+// CALLAUNCHER — per-instance Java only, PrismLauncher Java runtimes when available,
+// settings.json (C-style), download workers, no Blessed, full menus, auth, manifest, launch.
 import { Authflow } from "prismarine-auth";
 import cliProgress from "cli-progress";
 import os from "os";
@@ -18,8 +17,18 @@ const PRISM_AZUL_UID = "com.azul.java";
 // ---------- Mojang version manifest ----------
 const MOJANG_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
-// ---------- Auth cache path ----------
-const AUTH_CACHE_PATH = path.join(os.homedir(), "CALLUM_LAUNCH", "auth_cache.json");
+// ---------- Base paths ----------
+const BASE_DIR = path.join(os.homedir(), "CALLUM_LAUNCH");
+const VERSIONS_DIR = path.join(BASE_DIR, "versions");
+const ASSETS_DIR = path.join(BASE_DIR, "assets");
+const ASSET_OBJECTS_DIR = path.join(ASSETS_DIR, "objects");
+const ASSET_INDEXES_DIR = path.join(ASSETS_DIR, "indexes");
+const SETTINGS_PATH = path.join(BASE_DIR, "settings.json");
+const AUTH_CACHE_PATH = path.join(BASE_DIR, "auth_cache.json");
+
+for (const dir of [BASE_DIR, VERSIONS_DIR, ASSETS_DIR, ASSET_OBJECTS_DIR, ASSET_INDEXES_DIR]) {
+    fs.mkdirSync(dir, { recursive: true });
+}
 
 // ---------- Box message ----------
 function BoxMsg(msg) {
@@ -56,18 +65,6 @@ function findJavaBin(root) {
         }
     }
     return null;
-}
-
-// ---------- Base paths ----------
-const BASE_DIR = path.join(os.homedir(), "CALLUM_LAUNCH");
-const VERSIONS_DIR = path.join(BASE_DIR, "versions");
-const ASSETS_DIR = path.join(BASE_DIR, "assets");
-const ASSET_OBJECTS_DIR = path.join(ASSETS_DIR, "objects");
-const ASSET_INDEXES_DIR = path.join(ASSETS_DIR, "indexes");
-const SETTINGS_PATH = path.join(BASE_DIR, "settings.json");
-
-for (const dir of [BASE_DIR, VERSIONS_DIR, ASSETS_DIR, ASSET_OBJECTS_DIR, ASSET_INDEXES_DIR]) {
-    fs.mkdirSync(dir, { recursive: true });
 }
 
 // ---------- Settings (C-style perInstanceJava) ----------
@@ -396,12 +393,6 @@ async function downloadPrismAzulJava(versionId, requiredMajor) {
 
     console.log("[java] PrismLauncher Azul Java downloaded! PATH:", found);
     return found;
-}
-
-// ---------- Mojang Java runtime download (deprecated) ----------
-async function tryDownloadMojangJava(versionId, metadata) {
-    console.log("[java] Mojang Java runtime downloader is deprecated and not used anymore.");
-    return null;
 }
 
 // ---------- Java selection logic (PER INSTANCE ONLY) ----------
@@ -864,33 +855,21 @@ async function perInstanceJavaMenu() {
 
 // ---------- Auth ----------
 async function loadAuth() {
-    let cache = null;
-    try {
-        if (fs.existsSync(AUTH_CACHE_PATH)) {
-            const raw = fs.readFileSync(AUTH_CACHE_PATH, "utf8");
-            cache = JSON.parse(raw);
-        }
-    } catch {
-        cache = null;
-    }
-
-    const flow = new Authflow("CALLAUNCHER", AUTH_CACHE_PATH, {
-        authTitle: "CALLAUNCHER",
-        deviceType: "pc"
-    });
+    // We let prismarine-auth manage its own cache; AUTH_CACHE_PATH is used as cacheDirectory.
+    const flow = new Authflow(
+        "CALLAUNCHER",   // userIdentifier for caching
+        AUTH_CACHE_PATH  // cacheDirectory
+    );
 
     let auth;
     try {
-        auth = await flow.getMinecraftJavaToken(cache || undefined);
+        auth = await flow.getMinecraftJavaToken({ fetchProfile: true });
     } catch (err) {
-        console.log("[auth] Failed to use cache, trying fresh login...");
-        auth = await flow.getMinecraftJavaToken();
+        console.log("[auth] Failed to get Minecraft Java token:", err.message);
+        throw err;
     }
 
-    try {
-        fs.writeFileSync(AUTH_CACHE_PATH, JSON.stringify(auth, null, 2), "utf8");
-    } catch {}
-
+    // auth already contains profile + token; no extra manual cache needed
     return auth;
 }
 
