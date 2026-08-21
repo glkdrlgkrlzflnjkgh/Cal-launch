@@ -1,4 +1,5 @@
-// CALLAUNCHER — per-instance Java only, Mojang runtimes when available, settings.json (C-style), download workers, no Blessed
+// CALLAUNCHER — per-instance Java only, PrismLauncher Java runtimes when available, settings.json (C-style),
+// download workers, no Blessed, full menus, auth, manifest, launch.
 import { saveAuthCache, loadAuthCache } from "./secureStore.js";
 import { Authflow } from "prismarine-auth";
 import cliProgress from "cli-progress";
@@ -10,10 +11,17 @@ import readline from "readline";
 import { spawn } from "child_process";
 import AdmZip from "adm-zip";
 
+// ---------- PrismLauncher Java metadata ----------
+const PRISM_META_BASE = "https://meta.prismlauncher.org/v1";
+const PRISM_AZUL_UID = "com.azul.java";
 
-// ---------- Zulu Java Downloader (per-version) ----------
-// ---------- Zulu Java Downloader (Metadata API, per-version) ----------
-const ZULU_META = "https://api.azul.com/metadata/v1/zulu/packages/";
+// ---------- Mojang version manifest ----------
+const MOJANG_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+
+// ---------- Auth cache path ----------
+const AUTH_CACHE_PATH = path.join(os.homedir(), "CALLUM_LAUNCH", "auth_cache.json");
+
+// ---------- Box message ----------
 function BoxMsg(msg) {
     const lines = msg.split("\n");
     const width = Math.max(...lines.map(l => l.length));
@@ -27,61 +35,7 @@ function BoxMsg(msg) {
     console.log(bottom);
 }
 
-function detectZuluPlatform() {
-    const platform = process.platform;
-    const arch = process.arch;
-
-    let os, cpu;
-
-    if (platform === "win32") os = "windows";
-    else if (platform === "linux") os = "linux";
-    else if (platform === "darwin") os = "macos";
-    else os = "linux";
-
-    if (arch === "x64" || arch === "amd64") cpu = "x86_64";
-    else if (arch === "arm64") cpu = "aarch64";
-    else cpu = "x86_64";
-
-    return { os, cpu };
-}
-
-async function queryZuluMetadata(major) {
-    const { os, cpu } = detectZuluPlatform();
-
-    const params = new URLSearchParams({
-        java_version: String(major),
-        os,
-        arch: cpu,
-        java_package_type: "jdk",     // JRE deprecated
-        release_status: "ga",         // stable builds
-        availability_types: "CA",     // free community builds
-        page: "1",
-        page_size: "100"
-    });
-
-    const url = `${ZULU_META}?${params.toString()}`;
-    const res = await fetch(url);
-
-    if (!res.ok) {
-        throw new Error(`Zulu Metadata API HTTP ${res.status}`);
-    }
-
-    const list = await res.json();
-    if (!Array.isArray(list) || list.length === 0) {
-        return null;
-    }
-
-    // Filter only entries with a real download_url
-    const valid = list.filter(e => e.download_url);
-    if (valid.length === 0) return null;
-
-    // Pick the newest build (latest=true preferred)
-    const latest = valid.find(e => e.latest) || valid[valid.length - 1];
-
-    return latest;
-}
-
-// Move this OUTSIDE the function so it can be reused
+// ---------- Java bin finder ----------
 function findJavaBin(root) {
     if (!fs.existsSync(root)) return null;
 
@@ -103,74 +57,6 @@ function findJavaBin(root) {
     }
     return null;
 }
-
-async function downloadZuluJava(versionId, requiredMajor) {
-    const versionDir = path.join(VERSIONS_DIR, versionId);
-    const runtimeDir = path.join(versionDir, "java-zulu");
-
-    // ⭐ NEW: Check for ANY existing Java binary inside java-zulu/
-    const existing = findJavaBin(runtimeDir);
-    if (existing) {
-        console.log("[java] Existing Zulu runtime found.");
-        return existing;
-    }
-
-    console.log(`[java] Querying Azul Metadata API for Java ${requiredMajor}...`);
-
-    let pkg;
-    try {
-        pkg = await queryZuluMetadata(requiredMajor);
-    } catch (err) {
-        console.error("[java] Failed to query Zulu Metadata API:", err.message);
-        return null;
-    }
-
-    if (!pkg) {
-        console.error("[java] No suitable Zulu package found.");
-        return null;
-    }
-
-    const url = pkg.download_url;
-    if (!url) {
-        console.error("[java] Package has no download_url (unexpected).");
-        return null;
-    }
-
-    console.log(`[java] Downloading: ${pkg.name}`);
-
-    const tmpZip = path.join(versionDir, `zulu-${requiredMajor}.zip`);
-
-    try {
-        await downloadFile(url, tmpZip);
-    } catch (err) {
-        console.error("[java] Failed to download Zulu ZIP:", err.message);
-        return null;
-    }
-
-    // Extract ZIP
-    try {
-        await fs.promises.mkdir(runtimeDir, { recursive: true });
-        const zip = new AdmZip(tmpZip);
-        zip.extractAllTo(runtimeDir, true);
-    } catch (err) {
-        console.error("[java] Failed to extract Zulu ZIP:", err.message);
-        return null;
-    } finally {
-        fs.unlink(tmpZip, () => {});
-    }
-
-    // Find java binary again after extraction
-    const found = findJavaBin(runtimeDir);
-    if (!found) {
-        console.error("[java] Could not locate java binary in extracted Zulu runtime.");
-        return null;
-    }
-
-    console.log("[java] Zulu Java downloaded! PATH:", found);
-    return found;
-}
-
-
 
 // ---------- Base paths ----------
 const BASE_DIR = path.join(os.homedir(), "CALLUM_LAUNCH");
@@ -261,6 +147,52 @@ async function fetchJSON(url) {
     }
 }
 
+// single-file download with progress bar
+async function downloadFileWithProgress(url, dest, label = "[file]") {
+    await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(dest);
+
+        https.get(url, response => {
+            if (response.statusCode !== 200) {
+                file.close(() => fs.unlink(dest, () => {}));
+                reject(new Error(`HTTP ${response.statusCode} for ${url}`));
+                return;
+            }
+
+            const total = parseInt(response.headers["content-length"] || "0", 10);
+            const bar = new cliProgress.SingleBar(
+                {
+                    clearOnComplete: true,
+                    hideCursor: true,
+                    format: `${label} {bar} {percentage}% | {value}/{total} bytes`
+                },
+                cliProgress.Presets.shades_classic
+            );
+            if (total > 0) bar.start(total, 0);
+
+            let downloaded = 0;
+            response.on("data", chunk => {
+                downloaded += chunk.length;
+                if (total > 0) bar.update(downloaded);
+            });
+
+            response.pipe(file);
+            file.on("finish", () => {
+                file.close(() => {
+                    if (total > 0) bar.stop();
+                    resolve();
+                });
+            });
+        }).on("error", err => {
+            file.close(() => fs.unlink(dest, () => {}));
+            reject(err);
+        });
+    });
+}
+
+// legacy multi-file download queue with files-per-second
 async function downloadFile(url, dest) {
     await fs.promises.mkdir(path.dirname(dest), { recursive: true });
 
@@ -283,7 +215,7 @@ async function downloadFile(url, dest) {
     });
 }
 
-// ---------- Download workers ----------
+// ---------- Download workers (with files-per-second) ----------
 async function runDownloadQueue(jobs, name, workers) {
     if (jobs.length === 0) {
         console.log(`${name} All items already present.`);
@@ -294,8 +226,7 @@ async function runDownloadQueue(jobs, name, workers) {
         {
             clearOnComplete: true,
             hideCursor: true,
-            format: `${name} {bar} {percentage}% | {value}/{total}`
-            
+            format: `${name} {bar} {percentage}% | {value}/{total} files | {fps} files/s`
         },
         cliProgress.Presets.shades_classic
     );
@@ -303,6 +234,7 @@ async function runDownloadQueue(jobs, name, workers) {
 
     let index = 0;
     let completed = 0;
+    const startTime = Date.now();
 
     async function worker() {
         while (true) {
@@ -315,7 +247,9 @@ async function runDownloadQueue(jobs, name, workers) {
                 console.error(`\n${name} Failed: ${job.url} -> ${err.message}`);
             }
             completed++;
-            bar.update(completed);
+            const elapsedSec = (Date.now() - startTime) / 1000;
+            const fps = elapsedSec > 0 ? (completed / elapsedSec).toFixed(2) : "0.00";
+            bar.update(completed, { fps });
         }
     }
 
@@ -346,16 +280,16 @@ function isAtLeast(versionId, minId) {
     return true;
 }
 
-// ---------- OS → Mojang platform ----------
-function detectRuntimePlatform() {
+// ---------- OS → PrismLauncher runtimeOS ----------
+function detectPrismRuntimeOS() {
     const platform = process.platform;
     const arch = process.arch;
 
     if (platform === "win32") return "windows-x64";
-    if (platform === "linux") return "linux";
+    if (platform === "linux") return "linux-x64";
     if (platform === "darwin") {
         if (arch === "arm64") return "mac-os-arm64";
-        return "mac-os";
+        return "mac-os-x64";
     }
 
     return "windows-x64";
@@ -369,7 +303,7 @@ async function validateJavaPath(javaPath) {
             let done = false;
             proc.on("exit", () => {
                 done = true;
-                resolve(true); // even non-zero is usually fine for -version
+                resolve(true);
             });
             proc.on("error", () => resolve(false));
             setTimeout(() => {
@@ -381,109 +315,107 @@ async function validateJavaPath(javaPath) {
     });
 }
 
-// ---------- Mojang Java runtime download (per-version, from metadata.javaVersion.component) ----------
-// DEPRECATED, DO NOT USE OR MODIFY: Mojang runtimes are no longer commonly used and their API is dead. We use azul's Zulu API instead.
-async function tryDownloadMojangJava(versionId, metadata) {
+// ---------- PrismLauncher Java downloader (Azul provider) ----------
+async function downloadPrismAzulJava(versionId, requiredMajor) {
     const versionDir = path.join(VERSIONS_DIR, versionId);
-    const runtimeDir = path.join(versionDir, "java");
+    const runtimeDir = path.join(versionDir, "java-azul");
 
-    const javaBin =
-        process.platform === "win32"
-            ? path.join(runtimeDir, "bin", "java.exe")
-            : path.join(runtimeDir, "bin", "java");
-
-    if (fs.existsSync(javaBin)) {
-        return javaBin;
+    const existing = findJavaBin(runtimeDir);
+    if (existing) {
+        console.log("[java] Existing PrismLauncher Azul runtime found.");
+        return existing;
     }
 
-    const component = metadata.javaVersion?.component;
-    if (!component) {
-        console.log("[java] No javaVersion.component in metadata.");
-        return null;
-    }
+    console.log(`[java] Using PrismLauncher Azul metadata for Java ${requiredMajor}...`);
 
-    console.log(`\n[+] Trying Mojang Java runtime for ${versionId}: ${component}`);
-
-    // Step 1: fetch master manifest
-    let master;
+    let provider;
     try {
-        master = await fetchJSON(
-            "https://piston-meta.mojang.com/v1/products/java-runtime/manifest.json"
-        );
+        provider = await fetchJSON(`${PRISM_META_BASE}/${PRISM_AZUL_UID}`);
     } catch (err) {
-        console.error("[java] Failed to fetch master runtime manifest:", err.message);
+        console.error("[java] Failed to fetch PrismLauncher Azul provider manifest:", err.message);
         return null;
     }
 
-    // Step 2: find component entry
-    const compEntry = master.find(e => e.name === component);
-    if (!compEntry) {
-        console.error(`[java] Component '${component}' not found in master manifest.`);
+    const versions = provider.versions || [];
+    const targetId = `java${requiredMajor}`;
+    const entry = versions.find(v => v.version === targetId);
+    if (!entry) {
+        console.error(`[java] PrismLauncher Azul provider has no version '${targetId}'.`);
         return null;
     }
 
-    // Step 3: find platform entry
-    const platform = detectRuntimePlatform();
-    const platEntry = compEntry.platforms?.[platform];
-    if (!platEntry) {
-        console.error(`[java] Component '${component}' has no platform '${platform}'.`);
-        return null;
-    }
-
-    // Step 4: fetch platform manifest
-    let runtimeManifest;
+    let vManifest;
     try {
-        runtimeManifest = await fetchJSON(platEntry.manifest.url);
+        vManifest = await fetchJSON(`${PRISM_META_BASE}/${PRISM_AZUL_UID}/${targetId}.json`);
     } catch (err) {
-        console.error(`[java] Failed to fetch runtime manifest: ${err.message}`);
+        console.error("[java] Failed to fetch PrismLauncher Azul version manifest:", err.message);
         return null;
     }
 
-    // Step 5: download files
-    const files = runtimeManifest.files || {};
-    const jobs = [];
-
-    for (const [relPath, info] of Object.entries(files)) {
-        if (!info?.downloads?.raw?.url) continue;
-        const dest = path.join(runtimeDir, relPath);
-        jobs.push({ url: info.downloads.raw.url, dest, executable: !!info.executable });
-    }
-
-    await runDownloadQueue(jobs, "[java]", SETTINGS.downloadWorkers);
-
-    // Step 6: fix permissions
-    if (process.platform !== "win32") {
-        for (const job of jobs) {
-            if (job.executable) {
-                try { await fs.promises.chmod(job.dest, 0o755); } catch {}
-            }
-        }
-    }
-
-    if (!fs.existsSync(javaBin)) {
-        console.error("[java] Java binary missing after download.");
+    const runtimes = vManifest.runtimes || [];
+    const runtimeOS = detectPrismRuntimeOS();
+    const rt = runtimes.find(r => r.runtimeOS === runtimeOS);
+    if (!rt) {
+        console.error(`[java] No runtime for OS '${runtimeOS}' in PrismLauncher Azul Java ${requiredMajor}.`);
         return null;
     }
 
-    return javaBin;
+    const url = rt.url;
+    if (!url) {
+        console.error("[java] Runtime entry has no URL.");
+        return null;
+    }
+
+    console.log(`[java] Downloading Azul Java ${requiredMajor} from PrismLauncher: ${url}`);
+
+    const tmpZip = path.join(versionDir, `azul-${requiredMajor}.zip`);
+
+    try {
+        await downloadFileWithProgress(url, tmpZip, `[java ${requiredMajor}]`);
+    } catch (err) {
+        console.error("[java] Failed to download Azul ZIP:", err.message);
+        return null;
+    }
+
+    try {
+        await fs.promises.mkdir(runtimeDir, { recursive: true });
+        const zip = new AdmZip(tmpZip);
+        zip.extractAllTo(runtimeDir, true);
+    } catch (err) {
+        console.error("[java] Failed to extract Azul ZIP:", err.message);
+        return null;
+    } finally {
+        fs.unlink(tmpZip, () => {});
+    }
+
+    const found = findJavaBin(runtimeDir);
+    if (!found) {
+        console.error("[java] Could not locate java binary in extracted Azul runtime.");
+        return null;
+    }
+
+    console.log("[java] PrismLauncher Azul Java downloaded! PATH:", found);
+    return found;
 }
 
+// ---------- Mojang Java runtime download (deprecated) ----------
+async function tryDownloadMojangJava(versionId, metadata) {
+    console.log("[java] Mojang Java runtime downloader is deprecated and not used anymore.");
+    return null;
+}
 
 // ---------- Java selection logic (PER INSTANCE ONLY) ----------
 function requiredJavaMajorFor(versionId, metadata) {
-    // If Mojang metadata includes a majorVersion, trust it
     if (metadata?.javaVersion?.majorVersion) {
         return metadata.javaVersion.majorVersion;
     }
 
-    // Fallback rules (rarely needed)
     if (isAtLeast(versionId, "1.20.5")) return 21;
     if (isAtLeast(versionId, "1.17")) return 17;
     return 8;
 }
 
 async function ensureJavaRuntime(versionId, metadata) {
-    // 1) Per-instance Java from settings
     const entry = getPerInstanceJava(versionId);
     if (entry) {
         if (await validateJavaPath(entry.path)) {
@@ -495,15 +427,13 @@ async function ensureJavaRuntime(versionId, metadata) {
         }
     }
 
-    // 2) Zulu Java (per-version)
     const major = requiredJavaMajorFor(versionId, metadata);
-    const zulu = await downloadZuluJava(versionId, major);
-    if (zulu && await validateJavaPath(zulu)) {
-        console.log(`[java] Using downloaded Zulu Java ${major} for ${versionId}.`);
-        return zulu;
+    const azul = await downloadPrismAzulJava(versionId, major);
+    if (azul && await validateJavaPath(azul)) {
+        console.log(`[java] Using downloaded PrismLauncher Azul Java ${major} for ${versionId}.`);
+        return azul;
     }
 
-    // 3) Ask user as last resort
     console.log("\n[java] No valid Java runtime found.");
     console.log(`You must provide a Java executable path for version ${versionId}.`);
 
@@ -645,7 +575,6 @@ async function downloadAssets(metadata) {
 
     const jobs = [];
     for (const [, obj] of entries) {
-
         const hash = obj.hash;
         const subdir = hash.slice(0, 2);
         const dest = path.join(ASSET_OBJECTS_DIR, subdir, hash);
@@ -729,7 +658,7 @@ async function downloadVersion(versionId, manifest) {
     } else {
         console.log(`[client] Downloading client.jar to ${clientPath}`);
         try {
-            await downloadFile(clientUrl, clientPath);
+            await downloadFileWithProgress(clientUrl, clientPath, "[client]");
             console.log("[client] Done.");
         } catch (err) {
             console.error(`[client] Failed to download client.jar: ${err.message}`);
@@ -913,9 +842,9 @@ async function perInstanceJavaMenu() {
             }
             if (await validateJavaPath(p)) {
                 setPerInstanceJava(versionId, p);
-                console.log("Per-instance Java saved.");
+                console.log("Per-instance Java entry saved.");
             } else {
-                console.log("That Java path did not work. Not saved.");
+                console.log("That Java path did not work.");
             }
         } else if (choice === "R") {
             const versionId = await ask("Version ID to remove: ");
@@ -924,7 +853,7 @@ async function perInstanceJavaMenu() {
                 continue;
             }
             removePerInstanceJava(versionId);
-            console.log("Entry removed (if it existed).");
+            console.log("Per-instance Java entry removed (if it existed).");
         } else if (choice === "B") {
             return;
         } else {
@@ -933,170 +862,129 @@ async function perInstanceJavaMenu() {
     }
 }
 
-// ---------- Main auth ----------
-let result;
-async function authenticateAndCheckOwnership() {
-    let result;
+// ---------- Auth ----------
+async function loadAuth() {
+    let cache = null;
+    try {
+        if (fs.existsSync(AUTH_CACHE_PATH)) {
+            const raw = fs.readFileSync(AUTH_CACHE_PATH, "utf8");
+            cache = JSON.parse(raw);
+        }
+    } catch {
+        cache = null;
+    }
+
+    const flow = new Authflow("CALLAUNCHER", AUTH_CACHE_PATH, {
+        authTitle: "CALLAUNCHER",
+        deviceType: "pc"
+    });
+
+    let auth;
+    try {
+        auth = await flow.getMinecraftJavaToken(cache || undefined);
+    } catch (err) {
+        console.log("[auth] Failed to use cache, trying fresh login...");
+        auth = await flow.getMinecraftJavaToken();
+    }
 
     try {
-        console.log("[+] Authenticating with Microsoft...");
+        fs.writeFileSync(AUTH_CACHE_PATH, JSON.stringify(auth, null, 2), "utf8");
+    } catch {}
 
-        // Load cached token from secure storage
-        const cached = await loadAuthCache("default");
-
-        const flow = new Authflow("callauncher", "./auth-cache");
-
-        // IMPORTANT: ensure cache object exists BEFORE login
-        flow.cache = cached ? JSON.parse(cached) : {};
-
-        result = await flow.getMinecraftJavaToken({
-            fetchProfile: true,
-            fetchEntitlements: true
-        });
-
-        console.log("Username:", result.profile.name);
-        console.log("Authentication successful!");
-
-        // Save the FULL cache (including flow + msalConfig)
-        await saveAuthCache("default", JSON.stringify(flow.cache));
-
-    } catch (err) {
-        console.error("------ !!!FATAL ERROR!!! ------");
-        console.error("Authentication failed.");
-        console.error("If you're running this over SSH, the Linux keyring is locked and cannot store credentials.");
-        console.error("Please run the launcher from a desktop session instead.");
-        console.error(`Details: ${err.message}`);
-        process.exit(1);
-    }
-
-
-    // Ownership check
-    const ownsMinecraft = result.entitlements?.items?.some(
-        e => e.name === "game_minecraft"
-    );
-
-    if (!ownsMinecraft) {
-        console.error("----- !!YOU DO NOT OWN MINECRAFT!! -----");
-        console.error("In order to use this launcher, you must own Minecraft Java Edition on your Microsoft account.");
-        console.error("If you believe this is a mistake, please contact support with your account details.");
-        console.error("If you were attempting to use a cracked or pirated account, please purchase the game to use this launcher.");
-        console.error("-----------------------------------");
-        process.exit(1);
-    }
-
-    return result;
+    return auth;
 }
 
-result = await authenticateAndCheckOwnership();
-// ---------- Main menu loop ----------
-while (true) {
-    BoxMsg(
-        `=== CALLAUNCHER MENU ===
-    1. Install a version
-    2. Launch installed version
-    3. Uninstall a version
-    4. Settings
-    5. Exit`
-    );
+// ---------- Manifest fetch ----------
+async function loadMojangManifest() {
+    console.log("[meta] Fetching Mojang version manifest...");
+    return await fetchJSON(MOJANG_MANIFEST_URL);
+}
 
+// ---------- Main menu ----------
+async function mainMenu() {
+    BoxMsg("CALLAUNCHER\nPer-instance Java, PrismLauncher Azul runtimes,\nMojang assets & client, no Blessed.");
 
-    const choice = await ask("Select an option: ");
+    const auth = await loadAuth();
+    console.log(`[auth] Logged in as ${auth.profile.name} (${auth.profile.id})`);
 
-    if (choice === "1") {
-        let manifest;
-        try {
-            manifest = await fetchJSON(
-                "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
-            );
-        } catch (err) {
-            console.error(`[manifest] Failed to fetch version manifest: ${err.message}`);
-            continue;
-        }
+    let manifest;
+    try {
+        manifest = await loadMojangManifest();
+    } catch (err) {
+        console.error("[meta] Failed to load Mojang manifest:", err.message);
+        return;
+    }
 
-        console.log("\nInstall options:");
-        console.log("1. Latest release");
-        console.log("2. Latest snapshot");
-        console.log("3. Search & pick (>= 1.17.1)");
-        console.log("4. Specific version ID\n");
+    while (true) {
+        console.log("\n=== MAIN MENU ===");
+        console.log("1. Download & launch version");
+        console.log("2. Launch installed version");
+        console.log("3. Uninstall version");
+        console.log("4. Settings");
+        console.log("5. Exit\n");
 
-        const installChoice = await ask("Select an option: ");
+        const choice = await ask("Select an option: ");
 
-        let versionId = null;
-        if (installChoice === "1") {
-            versionId = manifest.latest.release;
-            console.log("Latest release:", versionId);
-        } else if (installChoice === "2") {
-            versionId = manifest.latest.snapshot;
-            console.log("Latest snapshot:", versionId);
-        } else if (installChoice === "3") {
-            versionId = await pickVersionFromManifest(manifest);
-            if (!versionId) {
-                console.log("No version selected.");
+        if (choice === "1") {
+            const versionId = await pickVersionFromManifest(manifest);
+            if (!versionId) continue;
+
+            const metadata = await downloadVersion(versionId, manifest);
+            if (!metadata) continue;
+
+            await launchMinecraft(versionId, metadata, auth);
+        } else if (choice === "2") {
+            const installed = listInstalledVersions();
+            if (installed.length === 0) {
+                console.log("No installed versions.");
                 continue;
             }
-        } else if (installChoice === "4") {
-            versionId = await ask("Enter version ID (e.g., 1.20.4): ");
+
+            console.log("\nInstalled versions:");
+            installed.forEach((v, i) => console.log(`${i + 1}. ${v}`));
+            console.log("");
+
+            const idxStr = await ask("Select a version to launch by number: ");
+            const idx = parseInt(idxStr, 10) - 1;
+            if (isNaN(idx) || idx < 0 || idx >= installed.length) {
+                console.log("Invalid selection.");
+                continue;
+            }
+
+            const versionId = installed[idx];
+            const entry = manifest.versions.find(v => v.id === versionId);
+            if (!entry) {
+                console.log("Version not found in manifest; cannot fetch metadata.");
+                continue;
+            }
+
+            let metadata;
+            try {
+                metadata = await fetchJSON(entry.url);
+            } catch (err) {
+                console.error("[meta] Failed to fetch version metadata:", err.message);
+                continue;
+            }
+
+            await launchMinecraft(versionId, metadata, auth);
+        } else if (choice === "3") {
+            await uninstallVersionMenu();
+        } else if (choice === "4") {
+            await settingsMenu();
+        } else if (choice === "5") {
+            console.log("Goodbye.");
+            break;
         } else {
-            console.log("Cancelled.");
-            continue;
+            console.log("Invalid choice.");
         }
-
-        await downloadVersion(versionId, manifest);
-
-    } else if (choice === "2") {
-        const installed = listInstalledVersions();
-        if (installed.length === 0) {
-            console.log("No versions installed yet.");
-            continue;
-        }
-
-        console.log("\nInstalled versions:");
-        installed.forEach((v, i) => console.log(`${i + 1}. ${v}`));
-        console.log("");
-
-        const idxStr = await ask("Select a version by number: ");
-        const idx = parseInt(idxStr, 10) - 1;
-        if (isNaN(idx) || idx < 0 || idx >= installed.length) {
-            console.log("Invalid selection.");
-            continue;
-        }
-
-        const versionId = installed[idx];
-
-        let manifest;
-        try {
-            manifest = await fetchJSON(
-                "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
-            );
-        } catch (err) {
-            console.error(`[manifest] Failed to fetch version manifest: ${err.message}`);
-            continue;
-        }
-
-        const entry = manifest.versions.find(v => v.id === versionId);
-        if (!entry) {
-            console.log("Version metadata not found in manifest.");
-            continue;
-        }
-
-        let metadata;
-        try {
-            metadata = await fetchJSON(entry.url);
-        } catch (err) {
-            console.error(`[meta] Failed to fetch version metadata: ${err.message}`);
-            continue;
-        }
-
-        await launchMinecraft(versionId, metadata, result);
-
-    } else if (choice === "3") {
-        await uninstallVersionMenu();
-    } else if (choice === "4") {
-        await settingsMenu();
-    } else if (choice === "5") {
-        console.log("Goodbye!");
-        process.exit(0);
-    } else {
-        console.log("Invalid choice.");
     }
 }
+
+// ---------- Entry point ----------
+(async () => {
+    try {
+        await mainMenu();
+    } catch (err) {
+        console.error("Fatal error:", err);
+    }
+})();
