@@ -9,7 +9,7 @@ import https from "https";
 import readline from "readline";
 import { spawn } from "child_process";
 import AdmZip from "adm-zip";
-
+import Fuse from "fuse.js";
 // ---------- PrismLauncher Java metadata ----------
 const PRISM_META_BASE = "https://meta.prismlauncher.org/v1";
 const PRISM_AZUL_UID = "com.azul.java";
@@ -638,29 +638,45 @@ async function pickVersionFromManifest(manifest) {
     }
 
     const search = await ask("Filter versions (e.g. 1.20, leave blank for all): ");
-    const filtered = all.filter(v => v.id.includes(search));
+
+    let filtered;
+
+    if (!search.trim()) {
+        // No search → show everything
+        filtered = all;
+    } else {
+        const fuse = new Fuse(all, {
+            keys: ["id", "type"],
+            threshold: 0.4,        // lower = stricter, higher = fuzzier
+            ignoreLocation: true,  // allows matching anywhere in the string
+            includeScore: true
+        });
+
+        filtered = fuse.search(search).map(r => r.item);
+    }
 
     if (filtered.length === 0) {
         console.log("No versions match that filter.");
         return null;
     }
 
-    const toShow = filtered;
     console.log("\nMatching versions:");
-    toShow.forEach((v, i) => {
+    filtered.forEach((v, i) => {
         console.log(`${i + 1}. ${v.id} (${v.type})`);
     });
     console.log("");
 
     const idxStr = await ask("Select a version by number: ");
     const idx = parseInt(idxStr, 10) - 1;
-    if (isNaN(idx) || idx < 0 || idx >= toShow.length) {
+
+    if (isNaN(idx) || idx < 0 || idx >= filtered.length) {
         console.log("Invalid selection.");
         return null;
     }
 
-    return toShow[idx].id;
+    return filtered[idx].id;
 }
+
 
 // ---------- Version download (per version dir) ----------
 async function downloadVersion(versionId, manifest) {
