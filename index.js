@@ -5,6 +5,7 @@ import cliProgress from "cli-progress";
 import os from "os";
 import path from "path";
 import fs from "fs";
+import { createHash } from "crypto";
 import https from "https";
 import readline from "readline";
 import { spawn } from "child_process";
@@ -212,6 +213,45 @@ async function downloadFile(url, dest) {
     });
 }
 
+async function isFileValid(filePath, expected = {}) {
+    try {
+        const stat = await fs.promises.stat(filePath);
+        if (!stat.isFile()) return false;
+        if (Number.isFinite(expected.size) && stat.size !== expected.size) return false;
+        if (!expected.sha1) return true;
+        if (typeof expected.sha1 !== "string" || !/^[a-f0-9]{40}$/i.test(expected.sha1)) return false;
+
+        const hash = createHash("sha1");
+        await new Promise((resolve, reject) => {
+            const stream = fs.createReadStream(filePath);
+            stream.on("data", chunk => hash.update(chunk));
+            stream.on("error", reject);
+            stream.on("end", resolve);
+        });
+        return hash.digest("hex").toLowerCase() === expected.sha1.toLowerCase();
+    } catch (err) {
+        if (err.code === "ENOENT") return false;
+        throw err;
+    }
+}
+
+async function getJobsNeedingDownload(jobs, workers) {
+    const invalid = [];
+    let index = 0;
+
+    async function worker() {
+        while (index < jobs.length) {
+            const job = jobs[index++];
+            if (!await isFileValid(job.dest, job.expected)) invalid.push(job);
+        }
+    }
+
+    await Promise.all(
+        Array.from({ length: Math.max(1, Math.min(workers, jobs.length)) }, worker)
+    );
+    return invalid;
+}
+
 // ---------- Download workers (with files-per-second) ----------
 async function runDownloadQueue(jobs, name, workers) {
     if (jobs.length === 0) {
@@ -273,6 +313,7 @@ async function runDownloadQueue(jobs, name, workers) {
     let index = 0;
     let completed = 0;
     const startTime = Date.now();
+    const failures = [];
 
     async function worker() {
         while (true) {
@@ -281,8 +322,13 @@ async function runDownloadQueue(jobs, name, workers) {
             job = jobs[index++];
             try {
                 await downloadFile(job.url, job.dest);
+                if (!await isFileValid(job.dest, job.expected)) {
+                    await fs.promises.unlink(job.dest).catch(() => {});
+                    throw new Error("Downloaded file failed integrity validation.");
+                }
             } catch (err) {
                 console.error(`\n${name} Failed: ${job.url} -> ${err.message}`);
+                failures.push(`${job.dest}: ${err.message}`);
             }
             completed++;
             const elapsedSec = (Date.now() - startTime) / 1000;
@@ -298,6 +344,9 @@ async function runDownloadQueue(jobs, name, workers) {
     }
     await Promise.all(promises);
     bar.stop();
+    if (failures.length > 0) {
+        throw new Error(`${name} ${failures.length} download(s) failed:\n${failures.join("\n")}`);
+    }
     console.log(`${name} Done.`);
 }
 
@@ -512,12 +561,15 @@ async function downloadLibraries(metadata, versionId) {
         const relPath = getLibraryPath(lib, artifact);
         const dest = path.join(versionLibDir, relPath);
 
-        if (!fs.existsSync(dest)) {
-            jobs.push({ url: artifact.url, dest });
-        }
+        jobs.push({
+            url: artifact.url,
+            dest,
+            expected: { sha1: artifact.sha1, size: artifact.size }
+        });
     }
 
-    await runDownloadQueue(jobs, "[libs]", SETTINGS.downloadWorkers);
+    const needed = await getJobsNeedingDownload(jobs, SETTINGS.downloadWorkers);
+    await runDownloadQueue(needed, "[libs]", SETTINGS.downloadWorkers);
 }
 
 // ---------- Natives (legacy-style only) ----------
@@ -559,17 +611,22 @@ async function downloadAndExtractNatives(metadata, versionId) {
     for (const { info } of nativeEntries) {
         const jarName = path.basename(info.path || "natives.jar");
         const jarPath = path.join(tempDir, jarName);
-        jobs.push({ url: info.url, dest: jarPath });
+        jobs.push({
+            url: info.url,
+            dest: jarPath,
+            expected: { sha1: info.sha1, size: info.size }
+        });
     }
 
-    await runDownloadQueue(jobs, "[natives]", SETTINGS.downloadWorkers);
+    const needed = await getJobsNeedingDownload(jobs, SETTINGS.downloadWorkers);
+    await runDownloadQueue(needed, "[natives]", SETTINGS.downloadWorkers);
 
     for (const { dest } of jobs) {
         try {
             const zip = new AdmZip(dest);
             zip.extractAllTo(nativesDir, true);
         } catch (err) {
-            console.error(`[natives] Failed to extract ${dest}: ${err.message}`);
+            throw new Error(`[natives] Failed to extract ${dest}: ${err.message}`);
         }
     }
 
@@ -597,10 +654,19 @@ async function downloadAssets(metadata) {
 
     let assetIndex;
     try {
-        assetIndex = await fetchJSON(assetIndexInfo.url);
+        const response = await fetch(assetIndexInfo.url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const indexBytes = Buffer.from(await response.arrayBuffer());
+        const indexHash = createHash("sha1").update(indexBytes).digest("hex");
+        if (assetIndexInfo.sha1 && indexHash.toLowerCase() !== assetIndexInfo.sha1.toLowerCase()) {
+            throw new Error("Asset index failed SHA-1 validation.");
+        }
+        if (Number.isFinite(assetIndexInfo.size) && indexBytes.length !== assetIndexInfo.size) {
+            throw new Error("Asset index failed size validation.");
+        }
+        assetIndex = JSON.parse(indexBytes.toString("utf8"));
     } catch (err) {
-        console.error(`[assets] Failed to fetch asset index: ${err.message}`);
-        return;
+        throw new Error(`[assets] Failed to fetch or validate asset index: ${err.message}`);
     }
 
     const indexPath = path.join(ASSET_INDEXES_DIR, `${assetIndexInfo.id}.json`);
@@ -608,7 +674,7 @@ async function downloadAssets(metadata) {
         await fs.promises.writeFile(indexPath, JSON.stringify(assetIndex, null, 2), "utf8");
         console.log(`[assets] Saved asset index to ${indexPath}`);
     } catch (err) {
-        console.error(`[assets] Failed to save asset index: ${err.message}`);
+        throw new Error(`[assets] Failed to save asset index: ${err.message}`);
     }
     console.log("[assets] Ready to download asset objects...");
     const objects = assetIndex.objects || {};
@@ -617,16 +683,18 @@ async function downloadAssets(metadata) {
     const jobs = [];
     for (const [, obj] of entries) {
         const hash = obj.hash;
+        if (!/^[a-f0-9]{40}$/i.test(hash || "")) {
+            throw new Error(`[assets] Invalid SHA-1 in asset index for '${hash}'.`);
+        }
         const subdir = hash.slice(0, 2);
         const dest = path.join(ASSET_OBJECTS_DIR, subdir, hash);
 
-        if (!fs.existsSync(dest)) {
-            const url = `https://resources.download.minecraft.net/${subdir}/${hash}`;
-            jobs.push({ url, dest });
-        }
+        const url = `https://resources.download.minecraft.net/${subdir}/${hash}`;
+        jobs.push({ url, dest, expected: { sha1: hash, size: obj.size } });
     }
 
-    await runDownloadQueue(jobs, "[assets]", SETTINGS.downloadWorkers);
+    const needed = await getJobsNeedingDownload(jobs, SETTINGS.downloadWorkers);
+    await runDownloadQueue(needed, "[assets]", SETTINGS.downloadWorkers);
 }
 
 // ---------- Searchable version picker ----------
@@ -705,19 +773,37 @@ async function downloadVersion(versionId, manifest) {
         return null;
     }
 
-    await downloadLibraries(metadata, versionId);
-    await downloadAndExtractNatives(metadata, versionId);
-    await downloadAssets(metadata);
+    try {
+        await downloadLibraries(metadata, versionId);
+        await downloadAndExtractNatives(metadata, versionId);
+        await downloadAssets(metadata);
+    } catch (err) {
+        console.error(`[download] Failed to prepare verified game files: ${err.message}`);
+        return null;
+    }
 
     const clientPath = path.join(versionDir, "client.jar");
-    if (fs.existsSync(clientPath)) {
-        console.log(`[client] Already exists: ${clientPath}`);
+    const clientExpected = {
+        sha1: metadata.downloads.client.sha1,
+        size: metadata.downloads.client.size
+    };
+    if (await isFileValid(clientPath, clientExpected)) {
+        console.log(`[client] Already exists and passed integrity validation: ${clientPath}`);
     } else {
+        if (fs.existsSync(clientPath)) {
+            console.log("[client] Existing client.jar is damaged; replacing it.");
+            await fs.promises.unlink(clientPath);
+        }
         console.log(`[client] Downloading client.jar to ${clientPath}`);
         try {
             await downloadFileWithProgress(clientUrl, clientPath, "[client]");
+            if (!await isFileValid(clientPath, clientExpected)) {
+                await fs.promises.unlink(clientPath).catch(() => {});
+                throw new Error("Downloaded client.jar failed integrity validation.");
+            }
             console.log("[client] Done.");
         } catch (err) {
+            await fs.promises.unlink(clientPath).catch(() => {});
             console.error(`[client] Failed to download client.jar: ${err.message}`);
             return null;
         }
@@ -753,6 +839,35 @@ async function launchMinecraft(versionId, metadata, auth) {
     const versionLibDir = path.join(versionDir, "libraries");
     const nativesDir = path.join(versionDir, "natives");
 
+    try {
+        await downloadLibraries(metadata, versionId);
+        await downloadAndExtractNatives(metadata, versionId);
+        await downloadAssets(metadata);
+
+        const clientPath = path.join(versionDir, "client.jar");
+        const client = metadata.downloads?.client;
+        if (!client?.url) throw new Error("Version metadata has no client JAR URL.");
+        if (!await isFileValid(clientPath, { sha1: client.sha1, size: client.size })) {
+            await fs.promises.mkdir(versionDir, { recursive: true });
+            await fs.promises.unlink(clientPath).catch(err => {
+                if (err.code !== "ENOENT") throw err;
+            });
+            console.log("[launch] Client JAR is missing or damaged; downloading a verified copy.");
+            try {
+                await downloadFileWithProgress(client.url, clientPath, "[client]");
+                if (!await isFileValid(clientPath, { sha1: client.sha1, size: client.size })) {
+                    throw new Error("Downloaded client JAR failed integrity validation.");
+                }
+            } catch (err) {
+                await fs.promises.unlink(clientPath).catch(() => {});
+                throw err;
+            }
+        }
+    } catch (err) {
+        console.error(`[launch] Asset/JAR integrity check or repair failed: ${err.message}`);
+        return;
+    }
+
     const libs = (metadata.libraries || [])
         .map(lib => {
             const artifact = lib.downloads?.artifact;
@@ -763,11 +878,6 @@ async function launchMinecraft(versionId, metadata, auth) {
         .filter(Boolean);
 
     const clientJar = path.join(versionDir, "client.jar");
-    if (!fs.existsSync(clientJar)) {
-        console.error("[launch] Client jar is MISSING! Please reinstall this version!!");
-        return;
-    }
-
     const classpath = [...libs, clientJar].join(process.platform === "win32" ? ";" : ":");
 
     const java = await ensureJavaRuntime(versionId, metadata);
