@@ -18,8 +18,8 @@ const PRISM_AZUL_UID = "com.azul.java";
 const MOJANG_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 
 // ---------- Base paths ----------
-const BASE_DIR = path.join(os.homedir(), "CALLUM_LAUNCH");
-const VERSIONS_DIR = path.join(BASE_DIR, "versions");
+const BASE_DIR = path.join(os.homedir(), ".callum-launcher");
+const VERSIONS_DIR = path.join(BASE_DIR, "installed-jars");
 const ASSETS_DIR = path.join(BASE_DIR, "assets");
 const ASSET_OBJECTS_DIR = path.join(ASSETS_DIR, "objects");
 const ASSET_INDEXES_DIR = path.join(ASSETS_DIR, "indexes");
@@ -218,6 +218,47 @@ async function runDownloadQueue(jobs, name, workers) {
         console.log(`${name} All items already present.`);
         return;
     }
+	else {
+		console.log(`${name} Calculating total disk space usage...`);
+
+		const sizeBar = new cliProgress.SingleBar(
+			{
+				clearOnComplete: true,
+				hideCursor: true,
+				format: `${name} [calc] {bar} {percentage}% | {value}/{total} files`
+			},
+			cliProgress.Presets.shades_classic
+		);
+
+		sizeBar.start(jobs.length, 0);
+
+		let totalBytes = 0;
+		let completed = 0;
+
+		// Create an array of promises, but each promise updates the bar when done
+		const sizePromises = jobs.map(job =>
+			getRemoteFileSize(job.url)
+				.then(size => {
+					totalBytes += size;
+				})
+				.catch(() => {
+					// treat as 0
+				})
+				.finally(() => {
+					completed++;
+					sizeBar.update(completed);
+				})
+		);
+
+		// Wait for all HEAD requests to finish
+		await Promise.all(sizePromises);
+
+		sizeBar.stop();
+
+		const totalMB = (totalBytes / (1024 * 1024)).toFixed(2);
+		console.log(`${name} Need to get ${totalMB} MB of data...\n`);
+		console.log(`${name} Downloading ${jobs.length} files with ${workers} workers...`);
+	}
 
     const bar = new cliProgress.SingleBar(
         {
@@ -225,7 +266,7 @@ async function runDownloadQueue(jobs, name, workers) {
             hideCursor: true,
             format: `${name} {bar} {percentage}% | {value}/{total} files | {fps} files/s`
         },
-        cliProgress.Presets.shades_classic
+        cliProgress.Presets.shades_grey
     );
     bar.start(jobs.length, 0);
 
@@ -508,7 +549,7 @@ async function downloadAndExtractNatives(metadata, versionId) {
     }
 
     if (nativeEntries.length === 0) {
-        console.log("[natives] No legacy native libraries found for this version (modern versions bundle natives in jars).");
+        console.log("[natives] No natives exist for this version.");
         return;
     }
 
@@ -533,6 +574,15 @@ async function downloadAndExtractNatives(metadata, versionId) {
     }
 
     console.log("[✓] Natives extracted.");
+}
+
+function getRemoteFileSize(url) {
+    return new Promise(resolve => {
+        https.get(url, { method: "HEAD" }, res => {
+            const len = parseInt(res.headers["content-length"] || "0", 10);
+            resolve(len);
+        }).on("error", () => resolve(0));
+    });
 }
 
 // ---------- Assets (global) ----------
@@ -579,11 +629,11 @@ async function downloadAssets(metadata) {
     await runDownloadQueue(jobs, "[assets]", SETTINGS.downloadWorkers);
 }
 
-// ---------- Searchable version picker (1.17.1+) ----------
+// ---------- Searchable version picker ----------
 async function pickVersionFromManifest(manifest) {
-    const all = manifest.versions.filter(v => isAtLeast(v.id, "1.17.1"));
+    const all = manifest.versions || [];
     if (all.length === 0) {
-        console.log("No versions >= 1.17.1 found in manifest.");
+        console.log("No versions found in manifest.");
         return null;
     }
 
@@ -595,7 +645,7 @@ async function pickVersionFromManifest(manifest) {
         return null;
     }
 
-    const toShow = filtered.slice(0, 40);
+    const toShow = filtered;
     console.log("\nMatching versions:");
     toShow.forEach((v, i) => {
         console.log(`${i + 1}. ${v.id} (${v.type})`);
@@ -661,6 +711,24 @@ async function downloadVersion(versionId, manifest) {
     return metadata;
 }
 
+function handleMinecraftOutput(line) {
+    process.stdout.write(`\x1b[32m[MC OUT]\x1b[0m ${line}`);
+	if (line.includes("Crash report saved")) {
+        process.stdout.write("[!] Minecraft crashed!!");
+		process.stdout.write("\n");
+    }
+}
+
+function handleMinecraftError(line) {
+    process.stdout.write(`\x1b[31m[MC ERR]\x1b[0m ${line}`);
+	if (line.includes("Crash report saved")) {
+        process.stdout.write("[!] Minecraft crashed!!");
+		process.stdout.write("\n");
+    }
+}
+
+
+
 // ---------- Launch ----------
 async function launchMinecraft(versionId, metadata, auth) {
     console.log("\n[+] Preparing launch command...");
@@ -680,7 +748,7 @@ async function launchMinecraft(versionId, metadata, auth) {
 
     const clientJar = path.join(versionDir, "client.jar");
     if (!fs.existsSync(clientJar)) {
-        console.error("[launch] BUG!!!!! Client JAR missing at expected path:", clientJar);
+        console.error("[launch] Client jar is MISSING! Please reinstall this version!!");
         return;
     }
 
@@ -707,23 +775,40 @@ async function launchMinecraft(versionId, metadata, auth) {
         "--assetsDir", ASSETS_DIR,
         "--assetIndex", metadata.assetIndex?.id || versionId
     ];
-    console.log("[launch] Java command:", java);
-    console.log("[launch] libraries:");
-    libs.forEach(lib => console.log("  -", lib));
+
     console.log("[+] Launching Minecraft...");
-    try {
-        const mc = spawn(java, args, { stdio: "inherit" });
 
-        mc.on("error", err => {
-            console.error(`[launch] Failed to start Java process: ${err.message}`);
-        });
+    // ⭐ Wrap the process in a Promise so we can await it
+    return new Promise((resolve) => {
+        try {
+            const mc = spawn(java, args);
 
-        mc.on("close", code => {
-            console.log(`Minecraft exited with code ${code}`);
-        });
-    } catch (err) {
-        console.error(`[launch] Unexpected error while launching: ${err.message}`);
-    }
+            mc.stdout.on("data", data => {
+                handleMinecraftOutput(data.toString());
+            });
+
+            mc.stderr.on("data", data => {
+                handleMinecraftError(data.toString());
+            });
+
+            mc.on("error", err => {
+                console.error(`[launch] Failed to start Java process: ${err.message}`);
+            });
+
+            mc.on("close", code => {
+                if (code !== 0) {
+                    console.log(`Minecraft exited with code ${code}! The game has probably crashed.`);
+                } else {
+                    console.log(`Minecraft exited normally. (code 0)`);
+                }
+
+                resolve(code); // ⭐ This makes the function wait until MC closes
+            });
+        } catch (err) {
+            console.error(`[launch] Unexpected error while launching: ${err.message}`);
+            resolve(-1);
+        }
+    });
 }
 
 // ---------- Installed versions ----------
@@ -855,23 +940,39 @@ async function perInstanceJavaMenu() {
 
 // ---------- Auth ----------
 async function loadAuth() {
-    // We let prismarine-auth manage its own cache; AUTH_CACHE_PATH is used as cacheDirectory.
+	console.log("[auth] Logging in....");
     const flow = new Authflow(
-        "CALLAUNCHER",   // userIdentifier for caching
-        AUTH_CACHE_PATH  // cacheDirectory
+        "CALLAUNCHER",
+        AUTH_CACHE_PATH
     );
 
     let auth;
     try {
-        auth = await flow.getMinecraftJavaToken({ fetchProfile: true });
+        auth = await flow.getMinecraftJavaToken({
+            fetchProfile: true,
+            fetchEntitlements: true
+        });
     } catch (err) {
         console.log("[auth] Failed to get Minecraft Java token:", err.message);
         throw err;
     }
 
-    // auth already contains profile + token; no extra manual cache needed
+    // Explicit entitlement check
+    const ownsJava = auth.entitlements?.items?.some(
+        e => e.name === "product_minecraft"
+    );
+	console.log("[auth] Checking entitlements....");
+    if (!ownsJava) {
+        console.log("[auth] This account does NOT own a copy of Minecraft Java Edition.");
+        throw new Error("Minecraft Java entitlement missing.");
+    }
+	else {
+		console.log("[auth] You own a copy of minecraft!");
+	}
+
     return auth;
 }
+
 
 // ---------- Manifest fetch ----------
 async function loadMojangManifest() {
@@ -879,12 +980,45 @@ async function loadMojangManifest() {
     return await fetchJSON(MOJANG_MANIFEST_URL);
 }
 
+function formatToken(str, options = {}) {
+    if (typeof str !== "string") return "";
+
+    const {
+        visibleStart = 6,   // how many chars to show at the start
+        visibleEnd = 0,     // how many chars to show at the end
+        maskChar = "?",     // masking character
+        maxLength = null    // optional truncation limit
+    } = options;
+
+    // Optional truncation
+    let s = str;
+    if (maxLength && str.length > maxLength) {
+        s = str.slice(0, maxLength);
+    }
+
+    // If string is too short to mask, return as-is
+    if (s.length <= visibleStart + visibleEnd) return s;
+
+    const start = s.slice(0, visibleStart);
+    const end = visibleEnd > 0 ? s.slice(s.length - visibleEnd) : "";
+    const masked = maskChar.repeat(s.length - visibleStart - visibleEnd);
+
+    return start + masked + end;
+}
+
 // ---------- Main menu ----------
 async function mainMenu() {
-    BoxMsg("CALLAUNCHER\nPer-instance Java, PrismLauncher Azul runtimes,\nMojang assets & client, no Blessed.");
+    BoxMsg("CALLUM LAUNCHER - UNOFFICAL MINECRAFT JAVA EDITION LAUNCHER");
 
     const auth = await loadAuth();
-    console.log(`[auth] Logged in as ${auth.profile.name} (${auth.profile.id})`);
+    console.log(
+    `[auth] Logged in as ${auth.profile.name} (${auth.profile.id}) (tok: ${formatToken(auth.token, 
+		{ visibleStart: 6, 
+			visibleEnd: 4, 
+			maxLength: 20
+		})})`
+	);
+
 
     let manifest;
     try {
@@ -896,7 +1030,7 @@ async function mainMenu() {
 
     while (true) {
         console.log("\n=== MAIN MENU ===");
-        console.log("1. Download & launch version");
+        console.log("1. Download a version");
         console.log("2. Launch installed version");
         console.log("3. Uninstall version");
         console.log("4. Settings");
@@ -910,8 +1044,6 @@ async function mainMenu() {
 
             const metadata = await downloadVersion(versionId, manifest);
             if (!metadata) continue;
-
-            await launchMinecraft(versionId, metadata, auth);
         } else if (choice === "2") {
             const installed = listInstalledVersions();
             if (installed.length === 0) {
@@ -952,7 +1084,7 @@ async function mainMenu() {
             await settingsMenu();
         } else if (choice === "5") {
             console.log("Goodbye.");
-            break;
+            process.exit(0);
         } else {
             console.log("Invalid choice.");
         }
@@ -964,6 +1096,6 @@ async function mainMenu() {
     try {
         await mainMenu();
     } catch (err) {
-        console.error("Fatal error:", err);
+        console.error("Unexpected error! ", err);
     }
 })();
