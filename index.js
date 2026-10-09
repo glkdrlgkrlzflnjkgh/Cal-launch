@@ -252,8 +252,43 @@ async function getJobsNeedingDownload(jobs, workers) {
     return invalid;
 }
 
+async function verifyDownloadedFiles(jobs, name, workers) {
+    if (jobs.length === 0) return [];
+
+    const bar = new cliProgress.SingleBar(
+        {
+            clearOnComplete: true,
+            hideCursor: true,
+            format: `${name} [verify] {bar} {percentage}% | {value}/{total} files`
+        },
+        cliProgress.Presets.shades_classic
+    );
+    bar.start(jobs.length, 0);
+
+    const invalid = [];
+    let index = 0;
+    let completed = 0;
+
+    async function worker() {
+        while (index < jobs.length) {
+            const job = jobs[index++];
+            if (!await isFileValid(job.dest, job.expected)) invalid.push(job);
+            bar.update(++completed);
+        }
+    }
+
+    try {
+        await Promise.all(
+            Array.from({ length: Math.max(1, Math.min(workers, jobs.length)) }, worker)
+        );
+    } finally {
+        bar.stop();
+    }
+    return invalid;
+}
+
 // ---------- Download workers (with files-per-second) ----------
-async function runDownloadQueue(jobs, name, workers) {
+async function runDownloadQueue(jobs, name, workers, { validateAfterDownload = true } = {}) {
     if (jobs.length === 0) {
         console.log(`${name} All items already present.`);
         return;
@@ -322,7 +357,7 @@ async function runDownloadQueue(jobs, name, workers) {
             job = jobs[index++];
             try {
                 await downloadFile(job.url, job.dest);
-                if (!await isFileValid(job.dest, job.expected)) {
+                if (validateAfterDownload && !await isFileValid(job.dest, job.expected)) {
                     await fs.promises.unlink(job.dest).catch(() => {});
                     throw new Error("Downloaded file failed integrity validation.");
                 }
@@ -697,7 +732,26 @@ async function downloadAssets(metadata) {
     }
 
     const needed = await getJobsNeedingDownload(jobs, SETTINGS.downloadWorkers);
-    await runDownloadQueue(needed, "[assets]", SETTINGS.downloadWorkers);
+    await runDownloadQueue(needed, "[assets]", SETTINGS.downloadWorkers, {
+        validateAfterDownload: false
+    });
+
+    let invalid = await verifyDownloadedFiles(needed, "[assets]", SETTINGS.downloadWorkers);
+    if (invalid.length > 0) {
+        console.log(`[assets] ${invalid.length} downloaded object(s) failed verification; retrying.`);
+        for (const job of invalid) {
+            await fs.promises.unlink(job.dest).catch(err => {
+                if (err.code !== "ENOENT") throw err;
+            });
+        }
+        await runDownloadQueue(invalid, "[assets] retry", SETTINGS.downloadWorkers, {
+            validateAfterDownload: false
+        });
+        invalid = await verifyDownloadedFiles(invalid, "[assets] retry", SETTINGS.downloadWorkers);
+        if (invalid.length > 0) {
+            throw new Error(`[assets] ${invalid.length} object(s) still fail integrity verification after retry.`);
+        }
+    }
 }
 
 // ---------- Searchable version picker ----------
