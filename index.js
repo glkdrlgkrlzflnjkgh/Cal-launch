@@ -347,6 +347,9 @@ async function runDownloadQueue(jobs, name, workers) {
     if (failures.length > 0) {
         throw new Error(`${name} ${failures.length} download(s) failed:\n${failures.join("\n")}`);
     }
+	else {
+		console.log(`${name} All downloads completed successfully.`);
+	}
     console.log(`${name} Done.`);
 }
 
