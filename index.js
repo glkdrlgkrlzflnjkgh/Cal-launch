@@ -882,9 +882,9 @@ async function settingsMenu() {
         const choice = await ask("Select an option: ");
 
         if (choice === "1") {
-            const wStr = await ask("Enter number of download workers (1-16): ");
+            const wStr = await ask("Enter number of download workers (1-32): ");
             const w = parseInt(wStr, 10);
-            if (!isNaN(w) && w >= 1 && w <= 16) {
+            if (!isNaN(w) && w >= 1 && w <= 32) {
                 SETTINGS.downloadWorkers = w;
                 saveSettings(SETTINGS);
                 console.log(`Download workers set to ${w}.`);
